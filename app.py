@@ -1,36 +1,33 @@
-# reports.py
+from flask import Flask, request, jsonify
+import requests
 import os
 import datetime
-import base64
 import urllib.parse
-import requests
+from flask_cors import CORS
 
-from playwright.sync_api import sync_playwright
-from openai import OpenAI
+# 🔥 PDF + GPT Report System
+from reports import generate_and_email_reports_for_legacy_code
 
-# -------- CONFIG -------- #
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ---------------------- CONFIG ---------------------- #
 
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 
-PROSPECTS_TABLE = os.getenv("AIRTABLE_PROSPECTS_TABLE") or "Prospects"
+HQ_TABLE = os.getenv("AIRTABLE_PROSPECTS_TABLE") or "Prospects"
 DEEPDIVE_TABLE = os.getenv("AIRTABLE_DEEPDIVE_TABLE") or "Deep Dive Responses"
 
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-FROM_EMAIL = os.getenv("REPORTS_FROM_EMAIL")
+GHL_API_KEY = os.getenv("GHL_API_KEY")
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
+GHL_BASE_URL = "https://rest.gohighlevel.com/v1"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID):
-    raise RuntimeError("Airtable env vars missing")
-
-if not (OPENAI_API_KEY and SENDGRID_API_KEY and FROM_EMAIL):
-    raise RuntimeError("Reporting env vars missing")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+NEXTSTEP_URL = os.getenv("NEXTSTEP_URL") or "https://poweredbylegacycode.com/nextstep"
 
 
-# -------- Airtable helpers -------- #
+# ---------------------- HELPERS ---------------------- #
 
 def _h():
     return {
@@ -48,467 +45,204 @@ def _url(table, rec_id=None, params=None):
     return base
 
 
-def get_record_by_legacy_code(table: str, legacy_code: str):
-    """
-    Gets the most recent record by Legacy Code from given table.
-    Assumes there is a 'Legacy Code' field and optional 'Date Submitted'.
-    """
-    formula = f"{{Legacy Code}} = '{legacy_code}'"
-    params = {
-        "filterByFormula": formula,
-        "maxRecords": 1,
-    }
-    # If Deep Dive table has Date Submitted, we sort by it.
-    if table == DEEPDIVE_TABLE:
-        params["sort[0][field]"] = "Date Submitted"
-        params["sort[0][direction]"] = "desc"
+# ---------------------- PROSPECT LOGIC ---------------------- #
 
-    r = requests.get(_url(table, params=params), headers=_h())
+def get_or_create_prospect(email: str):
+    """
+    - Look up prospect by email
+    - If doesn't exist → create
+    - Generate / ensure Legacy Code
+    """
+
+    formula = f"{{Prospect Email}} = '{email}'"
+    search_url = _url(HQ_TABLE, params={"filterByFormula": formula, "maxRecords": 1})
+
+    r = requests.get(search_url, headers=_h())
     r.raise_for_status()
     data = r.json()
-    records = data.get("records", [])
-    if not records:
-        return None
-    return records[0]
 
+    # ---- If found ----
+    if data.get("records"):
+        rec = data["records"][0]
+        rec_id = rec["id"]
+        legacy_code = rec.get("fields", {}).get("Legacy Code")
 
-def get_prospect_and_deepdive(legacy_code: str):
-    """
-    Pulls:
-    - Prospect record (name, emails, GEM, etc.)
-    - Latest Deep Dive record (all 30 answers)
-    """
-    prospect_rec = get_record_by_legacy_code(PROSPECTS_TABLE, legacy_code)
-    if not prospect_rec:
-        raise ValueError(f"No Prospect found with Legacy Code {legacy_code}")
+        # Generate LC if missing
+        if not legacy_code:
+            auto = rec.get("fields", {}).get("AutoNum")
+            if auto is None:
+                r2 = requests.get(_url(HQ_TABLE, rec_id), headers=_h())
+                auto = r2.json().get("fields", {}).get("AutoNum")
 
-    deepdive_rec = get_record_by_legacy_code(DEEPDIVE_TABLE, legacy_code)
-    if not deepdive_rec:
-        raise ValueError(f"No Deep Dive record found for Legacy Code {legacy_code}")
+            legacy_code = f"Legacy-X25-OP{1000 + int(auto)}"
+            requests.patch(
+                _url(HQ_TABLE, rec_id),
+                headers=_h(),
+                json={"fields": {"Legacy Code": legacy_code}},
+            )
 
-    return prospect_rec["fields"], deepdive_rec["fields"]
+        return legacy_code, rec_id
 
+    # ---- If not found → create ----
 
-# -------- GPT content generation -------- #
+    payload = {"fields": {"Prospect Email": email}}
+    r = requests.post(_url(HQ_TABLE), headers=_h(), json=payload)
+    r.raise_for_status()
+    rec = r.json()
+    rec_id = rec["id"]
 
-def _deepdive_to_bullet_block(fields: dict) -> str:
-    """
-    Turns Airtable Deep Dive fields into a bullets block for GPT.
-    """
-    lines = []
-    for k, v in fields.items():
-        # Skip technical/system fields
-        if k in ("Legacy Code", "Prospects", "Created", "Date Submitted"):
-            continue
-        if v is None or v == "":
-            continue
-        lines.append(f"- {k}: {v}")
-    return "\n".join(lines)
+    auto = rec.get("fields", {}).get("AutoNum")
+    if auto is None:
+        r2 = requests.get(_url(HQ_TABLE, rec_id), headers=_h())
+        auto = r2.json().get("fields", {}).get("AutoNum")
 
-
-def _call_gpt(system_prompt: str, user_prompt: str) -> str:
-    """
-    Wraps OpenAI call.
-    """
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-        max_tokens=1800,
+    legacy_code = f"Legacy-X25-OP{1000 + int(auto)}"
+    requests.patch(
+        _url(HQ_TABLE, rec_id),
+        headers=_h(),
+        json={"fields": {"Legacy Code": legacy_code}},
     )
-    return resp.choices[0].message.content
+
+    return legacy_code, rec_id
 
 
-def generate_prospect_report_text(prospect: dict, deepdive: dict) -> str:
+# ---------------------- SAVE DEEP DIVE ---------------------- #
+
+def save_deepdive_to_airtable(legacy_code: str, prospect_id: str, answers: dict):
     """
-    Text for the 90-Day Prospect Blueprint (prospect-facing language).
-    This still gets emailed only to the sponsor.
+    Save 30 deep dive answers exactly as they appear in your Deep Dive table.
+    answers = dict of {field_name: value}
     """
-    name = prospect.get("Prospect Name") or "this client"
-    gem = deepdive.get("Q6 Business Style (GEM)") or deepdive.get("GEM Type") or ""
-    bullets = _deepdive_to_bullet_block(deepdive)
 
-    system_prompt = """
-You are a strategic Herbalife-aligned business coach.
-Stay 100% compliant: do not make income guarantees, health claims, or disease language.
-You are creating a clear ACTION blueprint, not promising results.
-
-Rules:
-- Use words like: support, guide, help, optimize, align.
-- No curing, healing, treating, or guaranteed income.
-- Frame any numbers as scenarios or examples, not promises.
-- Focus on behaviors, routines, DMO, and trackable actions.
-- Style: Navy SEAL instructor meets elite wellness strategist.
-- Short sections, clear headers, bullet points. No fluff.
-    """.strip()
-
-    user_prompt = f"""
-The prospect is: {name}
-Their GEM style: {gem}
-
-Their Deep Dive answers:
-{bullets}
-
-Create a 90-Day Business Blueprint that includes:
-
-1) SNAPSHOT
-   - Who they are
-   - Their primary driver
-   - Their GEM lens (how they best respond)
-
-2) 90-DAY GAME PLAN (PHASED)
-   - Phase 1 (Weeks 1–4): foundation behaviors, learning, and daily minimum DMO
-   - Phase 2 (Weeks 5–8): skill-building, social proof, basic invites, tracking
-   - Phase 3 (Weeks 9–12): tightening scripts, follow-up rhythm, simple duplication
-
-3) DAILY / WEEKLY DMO
-   - Concrete daily actions (simple list)
-   - Weekly non-negotiables
-   - How to track so their coach can review
-
-4) RISK FACTORS & SUPPORT PLAN
-   - Based on their past patterns & obstacles
-   - How their coach should support them
-   - How THEY should support themselves
-
-5) BUSINESS PROJECTION (SCENARIO-BASED)
-   - Show 1–2 sample scenarios for what could happen in 90 days
-   - Use language like: "For example, if you complete X invites per week, you could potentially see..."
-   - Absolutely no income guarantees or health claims.
-
-Write it directly to the prospect, in second person ("you"), but keep it grounded and precise.
-    """.strip()
-
-    return _call_gpt(system_prompt, user_prompt)
-
-
-def generate_consult_report_text(prospect: dict, deepdive: dict) -> str:
-    """
-    Text for the Sponsor Consultation Briefing (coach-facing language).
-    """
-    name = prospect.get("Prospect Name") or "this prospect"
-    email = prospect.get("Prospect Email") or ""
-    gem = deepdive.get("Q6 Business Style (GEM)") or deepdive.get("GEM Type") or ""
-    bullets = _deepdive_to_bullet_block(deepdive)
-
-    system_prompt = """
-You are coaching a sponsor/coach on how to lead a 1:1 business consultation.
-You must stay 100% compliant:
-- No promises of income.
-- No disease or medical claims.
-- No hype.
-
-Your job:
-- Decode the prospect's GEM type and behavior.
-- Give the sponsor a tactical game plan for the consult.
-- Focus on questions, listening, and framing — not pitching.
-
-Tone:
-- Clear, direct, mentor-level.
-- Practical, bullet-heavy, easy to skim.
-    """.strip()
-
-    user_prompt = f"""
-Prospect:
-- Name: {name}
-- Email: {email}
-- GEM style: {gem}
-
-Deep Dive data:
-{bullets}
-
-Create a CONSULTATION BRIEFING for the sponsor with these sections:
-
-1) GEM SNAPSHOT & COMMUNICATION STYLE
-   - What this GEM cares about most
-   - How to speak so they feel seen
-   - Words to lean into, words to avoid
-
-2) BIG 3 MOTIVATORS (BASED ON THEIR ANSWERS)
-   - What is really driving them
-   - What to reflect back early in the call
-
-3) RED FLAGS & FRICTION POINTS
-   - Likely obstacles (time, confidence, structure, past failures, etc.)
-   - Questions to gently surface each one
-
-4) CONSULTATION FLOW (STEP-BY-STEP)
-   - Opening (2–3 key lines)
-   - Discovery questions (5–8 specific questions)
-   - How to present the 90-day blueprint in their GEM language
-   - How to frame expectations (effort, time, learning curve) without hype
-   - How to close ethically (inviting them into action without pressure)
-
-5) FOLLOW-UP & ACCOUNTABILITY PLAN
-   - How often to check in with them
-   - What to track (behaviors, not just outcomes)
-   - What "win" looks like at 30, 60, 90 days (behavioral, not income)
-
-Write this as if you are giving the sponsor a private briefing before the Zoom.
-Use clear headings and bullets. No fluff.
-    """.strip()
-
-    return _call_gpt(system_prompt, user_prompt)
-
-
-# -------- HTML templating -------- #
-
-def build_prospect_html(prospect: dict, legacy_code: str, body: str) -> str:
-    name = prospect.get("Prospect Name") or "Your 90-Day Blueprint"
-    today = datetime.date.today().strftime("%b %d, %Y")
-
-    return f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>90-Day Blueprint — {name}</title>
-  <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
-      background: #050608;
-      color: #f5f5f5;
-      margin: 0;
-      padding: 32px;
-    }}
-    .card {{
-      max-width: 780px;
-      margin: 0 auto;
-      background: #0f0f0f;
-      border-radius: 18px;
-      padding: 32px 36px;
-      border: 1px solid #222;
-    }}
-    h1, h2, h3 {{
-      color: #D4A72C;
-    }}
-    h1 {{
-      font-size: 26px;
-      margin-bottom: 4px;
-    }}
-    .meta {{
-      font-size: 13px;
-      color: #aaaaaa;
-      margin-bottom: 20px;
-    }}
-    .section {{
-      margin: 18px 0;
-    }}
-    ul {{
-      padding-left: 20px;
-    }}
-    li {{
-      margin: 4px 0;
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>90-Day Business Blueprint</h1>
-    <div class="meta">
-      Prospect: {name}<br>
-      Legacy Code: {legacy_code}<br>
-      Generated: {today}
-    </div>
-    <div class="section">
-      {body.replace('\n', '<br>')}
-    </div>
-  </div>
-</body>
-</html>
-    """.strip()
-
-
-def build_consult_html(prospect: dict, legacy_code: str, body: str) -> str:
-    name = prospect.get("Prospect Name") or "Prospect"
-    email = prospect.get("Prospect Email") or ""
-    today = datetime.date.today().strftime("%b %d, %Y")
-
-    return f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Consultation Briefing — {name}</title>
-  <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
-      background: #050608;
-      color: #f5f5f5;
-      margin: 0;
-      padding: 32px;
-    }}
-    .card {{
-      max-width: 780px;
-      margin: 0 auto;
-      background: #0f0f0f;
-      border-radius: 18px;
-      padding: 32px 36px;
-      border: 1px solid #222;
-    }}
-    h1, h2, h3 {{
-      color: #D4A72C;
-    }}
-    h1 {{
-      font-size: 26px;
-      margin-bottom: 4px;
-    }}
-    .meta {{
-      font-size: 13px;
-      color: #aaaaaa;
-      margin-bottom: 20px;
-    }}
-    .section {{
-      margin: 18px 0;
-    }}
-    ul {{
-      padding-left: 20px;
-    }}
-    li {{
-      margin: 4px 0;
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Consultation Briefing</h1>
-    <div class="meta">
-      Prospect: {name} ({email})<br>
-      Legacy Code: {legacy_code}<br>
-      Generated: {today}
-    </div>
-    <div class="section">
-      {body.replace('\n', '<br>')}
-    </div>
-  </div>
-</body>
-</html>
-    """.strip()
-
-
-# -------- Playwright PDF engine -------- #
-
-def html_to_pdf(html: str, out_path: str):
-    """
-    Renders HTML to PDF using Playwright + headless Chromium.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        page.set_content(html, wait_until="networkidle")
-        page.pdf(
-            path=out_path,
-            format="A4",
-            print_background=True,
-            margin={"top": "20mm", "bottom": "20mm", "left": "15mm", "right": "15mm"},
-        )
-        browser.close()
-
-
-# -------- Email sender (SendGrid) -------- #
-
-def send_reports_email(to_email: str, subject: str, text_body: str, attachments: list):
-    """
-    attachments: list of dicts with keys: filename, path
-    """
-    if not to_email:
-        raise ValueError("No recipient email for reports")
-
-    url = "https://api.sendgrid.com/v3/mail/send"
-
-    files_payload = []
-    for att in attachments:
-        with open(att["path"], "rb") as f:
-            content = base64.b64encode(f.read()).decode("utf-8")
-        files_payload.append(
-            {
-                "content": content,
-                "type": "application/pdf",
-                "filename": att["filename"],
-                "disposition": "attachment",
-            }
-        )
-
-    data = {
-        "personalizations": [
-            {
-                "to": [{"email": to_email}],
-            }
-        ],
-        "from": {"email": FROM_EMAIL, "name": "Legacy Code™ Reports"},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": text_body}],
-        "attachments": files_payload,
+    fields = {
+        "Legacy Code": legacy_code,
+        "Prospects": [prospect_id],
+        "Date Submitted": datetime.datetime.utcnow().isoformat(),
     }
 
-    headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # merge answers into Airtable fields
+    fields.update(answers)
 
-    r = requests.post(url, headers=headers, json=data)
+    r = requests.post(_url(DEEPDIVE_TABLE), headers=_h(), json={"fields": fields})
     r.raise_for_status()
 
+    return r.json().get("id")
 
-# -------- Orchestrator -------- #
 
-def generate_and_email_reports_for_legacy_code(legacy_code: str):
+# ---------------------- GHL SYNC ---------------------- #
+
+def sync_to_ghl(email: str, legacy_code: str):
     """
-    Main entry point:
-    - Fetch Prospect + Deep Dive
-    - Generate 2 texts via GPT
-    - Render 2 PDFs via Playwright
-    - Email BOTH PDFs to the sponsor (Assigned Op Email).
+    Attach LC + tag to GHL contact.
+    Returns assigned_user_id for routing.
     """
-    prospect, deepdive = get_prospect_and_deepdive(legacy_code)
 
-    sponsor_email = (
-        prospect.get("Assigned Op Email")
-        or prospect.get("Assigned Op Email (from Users)")
-        or prospect.get("Prospect Email")
-    )
+    try:
+        headers = {
+            "Authorization": f"Bearer {GHL_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-    # 1) Generate texts
-    prospect_text = generate_prospect_report_text(prospect, deepdive)
-    consult_text = generate_consult_report_text(prospect, deepdive)
+        lookup = requests.get(
+            f"{GHL_BASE_URL}/contacts/lookup",
+            headers=headers,
+            params={"email": email, "locationId": GHL_LOCATION_ID},
+        ).json()
 
-    # 2) Build HTML
-    prospect_html = build_prospect_html(prospect, legacy_code, prospect_text)
-    consult_html = build_consult_html(prospect, legacy_code, consult_text)
+        contact = None
+        if "contacts" in lookup and lookup["contacts"]:
+            contact = lookup["contacts"][0]
+        elif "contact" in lookup:
+            contact = lookup["contact"]
 
-    # 3) Paths (Railway /tmp is safe)
-    base = f"/tmp/{legacy_code.replace(' ', '_')}"
-    prospect_pdf_path = base + "_prospect_90_day_blueprint.pdf"
-    consult_pdf_path = base + "_consultation_briefing.pdf"
+        if not contact:
+            print("No GHL contact found.")
+            return None
 
-    html_to_pdf(prospect_html, prospect_pdf_path)
-    html_to_pdf(consult_html, consult_pdf_path)
+        ghl_id = contact.get("id")
+        assigned = (
+            contact.get("assignedUserId")
+            or contact.get("userId")
+            or contact.get("assignedTo")
+        )
 
-    # 4) Email to sponsor
-    subject = f"Legacy Code™ Reports — {legacy_code}"
-    body = (
-        "Attached are the two reports for your upcoming consultation:\n\n"
-        "1) 90-Day Business Blueprint (prospect-facing language)\n"
-        "2) Consultation Briefing (coach-only)\n\n"
-        "Reminder: These are scenario-based guides, not guarantees of any specific business or "
-        "health outcomes. Use them to support behaviors, tracking, and aligned expectations."
-    )
+        # Update LC + tag
+        requests.put(
+            f"{GHL_BASE_URL}/contacts/{ghl_id}",
+            headers=headers,
+            json={
+                "tags": ["deepdive-submitted"],
+                "customField": {"legacy_code_id": legacy_code},
+            },
+        )
 
-    send_reports_email(
-        to_email=sponsor_email,
-        subject=subject,
-        text_body=body,
-        attachments=[
-            {"filename": "90-day-blueprint.pdf", "path": prospect_pdf_path},
-            {"filename": "consultation-briefing.pdf", "path": consult_pdf_path},
-        ],
-    )
+        return assigned
 
-    return {
-        "prospect_pdf": prospect_pdf_path,
-        "consult_pdf": consult_pdf_path,
-        "sent_to": sponsor_email,
+    except Exception as e:
+        print("GHL Sync Error:", e)
+        return None
+
+
+# ---------------------- MAIN ROUTE: /submit ---------------------- #
+
+@app.route("/submit", methods=["POST"])
+def submit():
+    """
+    This is the Deep Dive submit endpoint.
+    It expects:
+    {
+        "email": "person@example.com",
+        "answers": {
+            "Q1 Field Name": "value",
+            "Q2 Field Name": "value",
+            ...
+        }
     }
+    """
+
+    try:
+        data = request.json or {}
+
+        email = (data.get("email") or "").strip()
+        answers = data.get("answers") or {}
+
+        if not email:
+            return jsonify({"error": "Missing email"}), 400
+
+        # Create/find Prospect + Legacy Code
+        legacy_code, prospect_id = get_or_create_prospect(email)
+
+        # Save Deep Dive answers
+        save_deepdive_to_airtable(legacy_code, prospect_id, answers)
+
+        # Sync to GHL
+        assigned_user_id = sync_to_ghl(email, legacy_code)
+
+        # ------------------- FIRE PDF GENERATION ------------------- #
+        try:
+            generate_and_email_reports_for_legacy_code(legacy_code)
+        except Exception as e:
+            print("PDF/Report Generation Error:", e)
+        # ------------------------------------------------------------ #
+
+        # Redirect
+        if assigned_user_id:
+            redirect_url = f"{NEXTSTEP_URL}?uid={assigned_user_id}"
+        else:
+            redirect_url = NEXTSTEP_URL
+
+        return jsonify({"redirect_url": redirect_url})
+
+    except Exception as e:
+        print(f"Submit Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
